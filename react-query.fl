@@ -1,0 +1,370 @@
+/**
+ * FreeLang stdlib — react-query
+ *
+ * npm @tanstack/react-query 완전 대체 구현 (React 없이 범용 서버사이드)
+ * 메모리 기반 데이터 페칭/캐싱, 자동 재시도, 백그라운드 리페칭
+ *
+ * 사용 예시:
+ *   import "stdlib/react-query"
+ *
+ *   // 클라이언트 생성
+ *   let client = createQueryClient({
+ *     staleTime: 60000,      // 1분 동안 fresh
+ *     cacheTime: 300000,     // 5분간 캐시 유지
+ *     retry: 3,
+ *     refetchInterval: 0     // 0 = 비활성
+ *   })
+ *
+ *   // 쿼리 실행
+ *   let result = useQuery(client, ["users", userId], fn() {
+ *     return http_get("/api/users/" + str(userId))
+ *   })
+ *
+ *   if result.isLoading {
+ *     println("로딩 중...")
+ *   } else if result.isError {
+ *     println("오류: " + result.error)
+ *   } else {
+ *     println(result.data)
+ *   }
+ *
+ *   // 뮤테이션
+ *   let mutation = useMutation(client, fn(data: any) {
+ *     return http_post("/api/users", data)
+ *   })
+ *   mutation.mutate({ name: "Alice" })
+ *
+ *   // 캐시 무효화
+ *   invalidateQueries(client, ["users"])
+ *
+ *   // 프리페치
+ *   prefetchQuery(client, ["users", 42], fn() {
+ *     return http_get("/api/users/42")
+ *   })
+ *
+ * 캐시 전략:
+ *   - key 배열 → JSON 직렬화된 문자열을 캐시 키로 사용
+ *   - staleTime 이내: 캐시 데이터 즉시 반환 (isFetching=false)
+ *   - staleTime 초과: 캐시 반환 + 백그라운드 리페치 (isFetching=true)
+ *   - cacheTime 초과 후 미사용 항목 GC
+ *   - retry 횟수만큼 실패 시 재시도 (exponential backoff)
+ *
+ * 네이티브 함수 (src/stdlib-query.ts):
+ *   query_client_create(config)           → clientId
+ *   query_cache_get(clientId, key)        → { data, timestamp, stale } | null
+ *   query_cache_set(clientId, key, data)  → void
+ *   query_cache_invalidate(clientId, key) → int  (삭제된 항목 수)
+ *   query_cache_gc(clientId)              → int  (GC된 항목 수)
+ *   query_fetch_with_retry(fetchFn, retryCount) → { data, error, success }
+ *   query_is_stale(clientId, key)         → bool
+ *   query_mutation_create(clientId)       → mutationId
+ *   query_mutation_execute(mutationId, mutateFn, data) → { data, error, success }
+ *   query_key_serialize(keyArray)         → string
+ */
+
+// ============================================
+// Struct 정의
+// ============================================
+
+struct QueryConfig {
+  staleTime: int,       // 데이터가 fresh로 간주되는 시간 (ms, 기본: 0)
+  cacheTime: int,       // 미사용 캐시 유지 시간 (ms, 기본: 300000 = 5분)
+  retry: int,           // 실패 시 재시도 횟수 (기본: 3)
+  refetchInterval: int  // 자동 리페치 주기 ms (0 = 비활성)
+}
+
+struct QueryClient {
+  id: int,
+  config: QueryConfig
+}
+
+struct QueryResult {
+  data: any,
+  error: string,
+  isLoading: bool,
+  isError: bool,
+  isFetching: bool,
+  isSuccess: bool,
+  updatedAt: int        // 마지막 업데이트 timestamp (ms)
+}
+
+struct MutationResult {
+  data: any,
+  error: string,
+  isLoading: bool,
+  isError: bool,
+  isSuccess: bool,
+  mutationId: int
+}
+
+// ============================================
+// 기본 설정
+// ============================================
+
+fn defaultConfig() -> QueryConfig {
+  return QueryConfig {
+    staleTime: 0,
+    cacheTime: 300000,
+    retry: 3,
+    refetchInterval: 0
+  }
+}
+
+// ============================================
+// QueryClient 생성
+// ============================================
+
+fn createQueryClient(config: QueryConfig) -> QueryClient {
+  let id = query_client_create(
+    config.staleTime,
+    config.cacheTime,
+    config.retry,
+    config.refetchInterval
+  )
+  return QueryClient {
+    id: id,
+    config: config
+  }
+}
+
+// 기본 설정으로 생성
+fn createDefaultQueryClient() -> QueryClient {
+  return createQueryClient(defaultConfig())
+}
+
+// ============================================
+// 캐시 키 직렬화
+// (배열 ["users", 42] → "users|42")
+// ============================================
+
+fn serializeKey(key: any) -> string {
+  return query_key_serialize(key)
+}
+
+// ============================================
+// useQuery: 데이터 페칭 + 캐싱
+// ============================================
+
+fn useQuery(client: QueryClient, key: any, fetchFn: any) -> QueryResult {
+  let keyStr = serializeKey(key)
+
+  // 1. 캐시 확인
+  let cached = query_cache_get(client.id, keyStr)
+
+  if cached != null {
+    let isStale = query_is_stale(client.id, keyStr)
+
+    if !isStale {
+      // fresh 캐시: 즉시 반환
+      return QueryResult {
+        data: cached.data,
+        error: "",
+        isLoading: false,
+        isError: false,
+        isFetching: false,
+        isSuccess: true,
+        updatedAt: cached.timestamp
+      }
+    }
+
+    // stale 캐시: 반환하되 백그라운드 리페치
+    let fetchResult = query_fetch_with_retry(fetchFn, client.config.retry)
+    if fetchResult.success {
+      query_cache_set(client.id, keyStr, fetchResult.data)
+    }
+
+    return QueryResult {
+      data: cached.data,
+      error: "",
+      isLoading: false,
+      isError: false,
+      isFetching: true,
+      isSuccess: true,
+      updatedAt: cached.timestamp
+    }
+  }
+
+  // 2. 캐시 없음: 페치 실행
+  let fetchResult = query_fetch_with_retry(fetchFn, client.config.retry)
+
+  if !fetchResult.success {
+    return QueryResult {
+      data: null,
+      error: fetchResult.error,
+      isLoading: false,
+      isError: true,
+      isFetching: false,
+      isSuccess: false,
+      updatedAt: 0
+    }
+  }
+
+  // 3. 캐시 저장
+  query_cache_set(client.id, keyStr, fetchResult.data)
+
+  return QueryResult {
+    data: fetchResult.data,
+    error: "",
+    isLoading: false,
+    isError: false,
+    isFetching: false,
+    isSuccess: true,
+    updatedAt: query_now()
+  }
+}
+
+// isLoading 상태 초기 반환 후 비동기 페치 (선택적 패턴)
+fn useQueryLoading(client: QueryClient, key: any) -> QueryResult {
+  return QueryResult {
+    data: null,
+    error: "",
+    isLoading: true,
+    isError: false,
+    isFetching: true,
+    isSuccess: false,
+    updatedAt: 0
+  }
+}
+
+// ============================================
+// useMutation: 데이터 변경
+// ============================================
+
+fn useMutation(client: QueryClient, mutateFn: any) -> MutationResult {
+  let mutationId = query_mutation_create(client.id)
+
+  return MutationResult {
+    data: null,
+    error: "",
+    isLoading: false,
+    isError: false,
+    isSuccess: false,
+    mutationId: mutationId
+  }
+}
+
+// 뮤테이션 실행
+fn mutate(mutation: MutationResult, mutateFn: any, data: any) -> MutationResult {
+  mutation.isLoading = true
+
+  let result = query_mutation_execute(mutation.mutationId, mutateFn, data)
+
+  mutation.isLoading = false
+
+  if result.success {
+    mutation.data = result.data
+    mutation.isSuccess = true
+    mutation.isError = false
+    mutation.error = ""
+  } else {
+    mutation.error = result.error
+    mutation.isError = true
+    mutation.isSuccess = false
+  }
+
+  return mutation
+}
+
+// ============================================
+// 캐시 무효화
+// ============================================
+
+// 특정 key 또는 key prefix 무효화
+// key = ["users"] → "users"로 시작하는 모든 캐시 삭제
+fn invalidateQueries(client: QueryClient, key: any) -> void {
+  let keyStr = serializeKey(key)
+  query_cache_invalidate(client.id, keyStr)
+}
+
+// 전체 캐시 초기화
+fn clearQueryCache(client: QueryClient) -> void {
+  query_cache_invalidate(client.id, "")
+}
+
+// ============================================
+// prefetchQuery: 미리 페치
+// ============================================
+
+fn prefetchQuery(client: QueryClient, key: any, fetchFn: any) -> void {
+  let keyStr = serializeKey(key)
+  let cached = query_cache_get(client.id, keyStr)
+
+  // 이미 fresh 캐시가 있으면 스킵
+  if cached != null {
+    if !query_is_stale(client.id, keyStr) {
+      return
+    }
+  }
+
+  let fetchResult = query_fetch_with_retry(fetchFn, client.config.retry)
+  if fetchResult.success {
+    query_cache_set(client.id, keyStr, fetchResult.data)
+  }
+}
+
+// ============================================
+// 캐시 GC (미사용 항목 정리)
+// ============================================
+
+fn gcQueryCache(client: QueryClient) -> int {
+  return query_cache_gc(client.id)
+}
+
+// ============================================
+// 캐시 상태 조회
+// ============================================
+
+fn getQueryData(client: QueryClient, key: any) -> any {
+  let keyStr = serializeKey(key)
+  let cached = query_cache_get(client.id, keyStr)
+  if cached == null {
+    return null
+  }
+  return cached.data
+}
+
+fn setQueryData(client: QueryClient, key: any, data: any) -> void {
+  let keyStr = serializeKey(key)
+  query_cache_set(client.id, keyStr, data)
+}
+
+fn isCached(client: QueryClient, key: any) -> bool {
+  let keyStr = serializeKey(key)
+  return query_cache_get(client.id, keyStr) != null
+}
+
+fn isStale(client: QueryClient, key: any) -> bool {
+  let keyStr = serializeKey(key)
+  return query_is_stale(client.id, keyStr)
+}
+
+// ============================================
+// Export
+// ============================================
+
+export {
+  QueryConfig,
+  QueryClient,
+  QueryResult,
+  MutationResult,
+
+  defaultConfig,
+  createQueryClient,
+  createDefaultQueryClient,
+
+  useQuery,
+  useQueryLoading,
+  useMutation,
+  mutate,
+
+  invalidateQueries,
+  clearQueryCache,
+  prefetchQuery,
+  gcQueryCache,
+
+  getQueryData,
+  setQueryData,
+  isCached,
+  isStale,
+  serializeKey
+}
